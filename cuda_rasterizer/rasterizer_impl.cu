@@ -73,7 +73,7 @@ __global__ void duplicateWithKeys(
 	const float* depths,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
-	uint32_t* gaussian_values_unsorted,
+	uint64_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid)
 {
@@ -103,7 +103,7 @@ __global__ void duplicateWithKeys(
 				key <<= 32;
 				key |= *((uint32_t*)&depths[idx]);
 				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
+				gaussian_values_unsorted[off] = idx<<32 | off;
 				off++;
 			}
 		}
@@ -190,6 +190,9 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
+	obtain(chunk, binning.dL_dcolors, P * NUM_CHANNELS, 128);
+	obtain(chunk, binning.dL_dmean2D, P * 2, 128);
+	obtain(chunk, binning.dL_dconic2D_dopacity, P * 4, 128);
 	return binning;
 }
 
@@ -400,10 +403,21 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		binningState.dL_dcolors,
+		binningState.dL_dmean2D,
+		binningState.dL_dconic2D_dopacity
+		), debug)
+	
+	CHECK_CUDA(BACKWARD::gather_gradients(
+		P,
+		geomState.point_offsets,
+		binningState.dL_dcolors,
+		binningState.dL_dmean2D,
+		binningState.dL_dconic2D_dopacity,
+		dL_dcolor,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
-		dL_dopacity,
-		dL_dcolor), debug)
+		dL_dopacity), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

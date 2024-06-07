@@ -57,9 +57,14 @@ namespace CudaRasterizer
 		size_t sorting_size;
 		uint64_t* point_list_keys_unsorted;
 		uint64_t* point_list_keys;
-		uint32_t* point_list_unsorted;
-		uint32_t* point_list;
+		uint64_t* point_list_unsorted;	// High 32 bits are the id of the gaussian,
+										// Low 32 bits are the index of the copy before sorting
+		uint64_t* point_list;
 		char* list_sorting_space;
+
+		float* dL_dcolors;
+		float2* dL_dmean2D;
+		float4* dL_dconic2D_dopacity;
 
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};

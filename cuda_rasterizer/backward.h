@@ -23,7 +23,7 @@ namespace BACKWARD
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
-		const uint32_t* point_list,
+		const uint64_t* point_list,
 		int W, int H,
 		const float* bg_color,
 		const float2* means2D,
@@ -32,10 +32,20 @@ namespace BACKWARD
 		const float* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
+		float* dL_dcolors,
+		float2* dL_dmean2D,
+		float4* dL_dconic2D_dopacity);
+
+	void gather_gradients(
+		int P,
+		const uint32_t* point_offsets,
+		const float* dL_dcolors_bin,
+		const float2* dL_dmean2D_bin,
+		const float4* dL_dconic2D_dopacity_bin,
+		float* dL_dcolors,
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
-		float* dL_dopacity,
-		float* dL_dcolors);
+		float* dL_dopacity);
 
 	void preprocess(
 		int P, int D, int M,

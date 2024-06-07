@@ -395,12 +395,49 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
+
+template<typename T>
+__forceinline__ __device__ T warpReduceSum(T val, const cg::coalesced_group &group) {
+	#pragma unroll
+	for (int offset = 32 / 2; offset > 0; offset /= 2)
+		val += group.shfl_down(val, offset);
+	return val;
+}
+
+
+template<typename T>
+__forceinline__ __device__ T warpReduceSum(T val) {
+	#pragma unroll
+	for (int offset = 32 / 2; offset > 0; offset /= 2)
+		val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+	return val;
+}
+__forceinline__ __device__ float2 warpReduceSum(float2 val) {
+	#pragma unroll
+	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+		val.x += __shfl_xor_sync(0xFFFFFFFF, val.x, offset);
+		val.y += __shfl_xor_sync(0xFFFFFFFF, val.y, offset);
+	}
+	return val;
+}
+__forceinline__ __device__ float4 warpReduceSum(float4 val) {
+	#pragma unroll
+	for (int offset = 32 / 2; offset > 0; offset /= 2) {
+		val.x += __shfl_xor_sync(0xFFFFFFFF, val.x, offset);
+		val.y += __shfl_xor_sync(0xFFFFFFFF, val.y, offset);
+		val.z += __shfl_xor_sync(0xFFFFFFFF, val.z, offset);
+		val.w += __shfl_xor_sync(0xFFFFFFFF, val.w, offset);
+	}
+	return val;
+}
+
+
 // Backward version of the rendering procedure.
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint64_t* __restrict__ point_list,
 	int W, int H,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
@@ -409,10 +446,9 @@ renderCUDA(
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
-	float3* __restrict__ dL_dmean2D,
-	float4* __restrict__ dL_dconic2D,
-	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	float2* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D_dopacity)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -428,10 +464,9 @@ renderCUDA(
 
 	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-	bool done = !inside;
 	int toDo = range.y - range.x;
 
-	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ int collected_offset[BLOCK_SIZE];	// Offsets of instances before sorting
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
@@ -469,8 +504,10 @@ renderCUDA(
 		const int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
-			const int coll_id = point_list[range.y - progress - 1];
-			collected_id[block.thread_rank()] = coll_id;
+			const uint64_t coll_id_and_offset = point_list[range.y - progress - 1];
+			const int coll_id = coll_id_and_offset>>32;
+			const int offset_before_sorting = coll_id_and_offset & 0xFFFFFFFF;
+			collected_offset[block.thread_rank()] = offset_before_sorting;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
@@ -478,81 +515,225 @@ renderCUDA(
 		}
 		block.sync();
 
+		static constexpr int REDUCTION_BATCH_SIZE = 8;
+		__shared__ float batch_dL_dcolors[REDUCTION_BATCH_SIZE][NUM_WARPS][C];
+		__shared__ float2 batch_dL_dmean2D[REDUCTION_BATCH_SIZE][NUM_WARPS];
+		__shared__ float4 batch_dL_dconic2D_dopacity[REDUCTION_BATCH_SIZE][NUM_WARPS];
+
 		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
+			float cur_dL_dcolors[C] = {0};
+			float2 cur_dL_dmean2D = {0, 0};
+			float4 cur_dL_dconic2D_dopacity = {0, 0, 0, 0};
+
 			contributor--;
-			if (contributor >= last_contributor)
-				continue;
+			if (inside && contributor < last_contributor) {
+				// Compute blending values, as before.
+				const float2 xy = collected_xy[j];
+				const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+				const float4 con_o = collected_conic_opacity[j];
+				const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
 
-			// Compute blending values, as before.
-			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
+				const float G = exp(power);
+				const float alpha = min(0.99f, con_o.w * G);
+				if (power <= 0.0f && alpha >= 1.0f / 255.0f) {
+					T = T / (1.f - alpha);
+					const float dchannel_dcolor = alpha * T;
 
-			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
-				continue;
+					// Propagate gradients to per-Gaussian colors and keep
+					// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+					// pair).
+					float dL_dalpha = 0.0f;
+					#pragma unroll
+					for (int ch = 0; ch < C; ch++)
+					{
+						const float c = collected_colors[ch * BLOCK_SIZE + j];
+						// Update last color (to be used in the next iteration)
+						accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+						last_color[ch] = c;
 
-			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
+						const float dL_dchannel = dL_dpixel[ch];
+						dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+						// Update the gradients w.r.t. color of the Gaussian. 
+						// Atomic, since this pixel is just one of potentially
+						// many that were affected by this Gaussian.
+						cur_dL_dcolors[ch] = dchannel_dcolor * dL_dchannel;
+					}
+					dL_dalpha *= T;
+					// Update last alpha (to be used in the next iteration)
+					last_alpha = alpha;
 
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-			float dL_dalpha = 0.0f;
-			const int global_id = collected_id[j];
-			for (int ch = 0; ch < C; ch++)
-			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
+					// Account for fact that alpha also influences how much of
+					// the background color is added if nothing left to blend
+					float bg_dot_dpixel = 0;
+					#pragma unroll
+					for (int i = 0; i < C; i++)
+						bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+					dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
 
-				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+					// Helpful reusable temporary variables
+					const float dL_dG = con_o.w * dL_dalpha;
+					const float gdx = G * d.x;
+					const float gdy = G * d.y;
+					const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+					const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+					// Update gradients w.r.t. 2D mean position of the Gaussian
+					// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+					// Update gradients w.r.t. opacity of the Gaussian
+					cur_dL_dmean2D = {
+						dL_dG * dG_ddelx * ddelx_dx,
+						dL_dG * dG_ddely * ddely_dy
+					};
+					cur_dL_dconic2D_dopacity = {
+						-0.5f * gdx * d.x * dL_dG,
+						-0.5f * gdx * d.y * dL_dG,
+						G * dL_dalpha,
+						-0.5f * gdy * d.y * dL_dG
+					};
+				}
 			}
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+			// Perform warp-level reduction
+			#pragma unroll
+			for (int ch = 0; ch < C; ch++)
+				cur_dL_dcolors[ch] = warpReduceSum(cur_dL_dcolors[ch]);
+			cur_dL_dmean2D = warpReduceSum(cur_dL_dmean2D);
+			cur_dL_dconic2D_dopacity = warpReduceSum(cur_dL_dconic2D_dopacity);
 
+			// Store the results in shared memory
+			if (block.thread_rank() % WARP_SIZE == 0)
+			{
+				int warp_id = block.thread_rank() / WARP_SIZE;
+				#pragma unroll
+				for (int ch = 0; ch < C; ch++)
+					batch_dL_dcolors[j%REDUCTION_BATCH_SIZE][warp_id][ch] = cur_dL_dcolors[ch];
+				batch_dL_dmean2D[j%REDUCTION_BATCH_SIZE][warp_id] = cur_dL_dmean2D;
+				batch_dL_dconic2D_dopacity[j%REDUCTION_BATCH_SIZE][warp_id] = cur_dL_dconic2D_dopacity;
+			}
 
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+			// If this is the last Gaussian in the batch, perform block-level
+			// reduction and store the results in global memory.
+			if (j % REDUCTION_BATCH_SIZE == REDUCTION_BATCH_SIZE - 1 || j == min(BLOCK_SIZE, toDo) - 1)
+			{
+				// Make sure we can perform this reduction with one warp
+				static_assert(NUM_WARPS <= WARP_SIZE);
+				// Make sure there are enough warps if we assign each warp with
+				// an item in the batch
+				static_assert(NUM_WARPS >= REDUCTION_BATCH_SIZE);
+				// Make sure the number of warps is a power of 2
+				// static_assert((NUM_WARPS & (NUM_WARPS - 1)) == 0);
 
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+				// Wait for all warps to finish
+				block.sync();
 
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+				int batch_start_j = j / REDUCTION_BATCH_SIZE * REDUCTION_BATCH_SIZE;
+				int batch_id = block.thread_rank() / WARP_SIZE;
+				if (batch_id < REDUCTION_BATCH_SIZE &&
+					batch_start_j+batch_id < min(BLOCK_SIZE, toDo)) {
+					int lane_id = block.thread_rank() % WARP_SIZE;
 
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+					// Perform warp-level reduction
+					#pragma unroll
+					for (int ch = 0; ch < C; ch++)
+						cur_dL_dcolors[ch] = warpReduceSum(
+							lane_id < NUM_WARPS ? batch_dL_dcolors[batch_id][lane_id][ch] : 0
+						);
+					cur_dL_dmean2D = warpReduceSum(
+						lane_id < NUM_WARPS ? 
+						batch_dL_dmean2D[batch_id][lane_id] :
+						float2{0, 0}
+					);
+					cur_dL_dconic2D_dopacity = warpReduceSum(
+						lane_id < NUM_WARPS ? 
+						batch_dL_dconic2D_dopacity[batch_id][lane_id] :
+						float4{0, 0, 0, 0}
+					);
+
+					// Store the results in global memory
+					if (lane_id == 0)
+					{
+						const int global_offset = collected_offset[batch_start_j+batch_id];
+						if constexpr(C == 3) {
+							// Special optimization for C == 3
+							((float3*)dL_dcolors)[global_offset] = make_float3(cur_dL_dcolors[0], cur_dL_dcolors[1], cur_dL_dcolors[2]);
+						} else {
+							#pragma unroll
+							for (int ch = 0; ch < C; ch++)
+								dL_dcolors[global_offset * C + ch] = cur_dL_dcolors[ch];
+						}
+						dL_dmean2D[global_offset] = cur_dL_dmean2D;
+						dL_dconic2D_dopacity[global_offset] = cur_dL_dconic2D_dopacity;
+					}
+				}
+
+				// Wait for all warps to finish reducing
+				if (j != min(BLOCK_SIZE, toDo) - 1)
+					block.sync();
+			}
 		}
+	}
+}
+
+template <uint32_t C>
+__global__ void gather_gradientsCUDA(
+	int P,
+	const uint32_t* __restrict__ point_offsets,
+	const float* __restrict__ dL_dcolors_bin,
+	const float2* __restrict__ dL_dmean2D_bin,
+	const float4* __restrict__ dL_dconic2D_dopacity_bin,
+	float* __restrict__ dL_dcolors,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity)
+{
+	// Every warp is responsible for one Gaussian
+	int gaussian_id = cg::this_grid().thread_rank() / WARP_SIZE;
+	if (gaussian_id >= P)
+		return;
+
+	int lane_id = cg::this_thread_block().thread_rank() % WARP_SIZE;
+	int range_start = gaussian_id == 0 ? 0 : point_offsets[gaussian_id-1];
+	int range_end = point_offsets[gaussian_id];
+
+	float dL_dcolors_sum[C] = { 0 };
+	float2 dL_dmean2D_sum = { 0, 0 };
+	float4 dL_dconic2D_dopacity_sum = { 0, 0, 0, 0 };
+
+	#pragma unroll 2
+	for (int i = range_start + lane_id; i < range_end; i += WARP_SIZE) {
+		#pragma unroll
+		for (int ch = 0; ch < C; ch++)
+			dL_dcolors_sum[ch] += dL_dcolors_bin[i * C + ch];
+		float2 cur_mean2d = dL_dmean2D_bin[i];
+		dL_dmean2D_sum.x += cur_mean2d.x;
+		dL_dmean2D_sum.y += cur_mean2d.y;
+		float4 cur_conic2d_dopacity = dL_dconic2D_dopacity_bin[i];
+		dL_dconic2D_dopacity_sum.x += cur_conic2d_dopacity.x;
+		dL_dconic2D_dopacity_sum.y += cur_conic2d_dopacity.y;
+		dL_dconic2D_dopacity_sum.z += cur_conic2d_dopacity.z;
+		dL_dconic2D_dopacity_sum.w += cur_conic2d_dopacity.w;
+	}
+
+	// Warp-level reduction
+	#pragma unroll
+	for (int ch = 0; ch < C; ch++)
+		dL_dcolors_sum[ch] = warpReduceSum(dL_dcolors_sum[ch]);
+	dL_dmean2D_sum = warpReduceSum(dL_dmean2D_sum);
+	dL_dconic2D_dopacity_sum = warpReduceSum(dL_dconic2D_dopacity_sum);
+
+	// Write-back
+	if (lane_id == 0) {
+		#pragma unroll
+		for (int ch = 0; ch < C; ch++)
+			dL_dcolors[gaussian_id * C + ch] = dL_dcolors_sum[ch];
+		dL_dmean2D[gaussian_id].x = dL_dmean2D_sum.x;
+		dL_dmean2D[gaussian_id].y = dL_dmean2D_sum.y;
+		dL_dconic2D[gaussian_id] = dL_dconic2D_dopacity_sum;
+		dL_dopacity[gaussian_id] = dL_dconic2D_dopacity_sum.z;
 	}
 }
 
@@ -621,10 +802,35 @@ void BACKWARD::preprocess(
 		dL_drot);
 }
 
+void BACKWARD::gather_gradients(
+	int P,
+	const uint32_t* point_offsets,
+	const float* dL_dcolors_bin,
+	const float2* dL_dmean2D_bin,
+	const float4* dL_dconic2D_dopacity_bin,
+	float* dL_dcolors,
+	float3* dL_dmean2D,
+	float4* dL_dconic2D,
+	float* dL_dopacity)
+{
+	static constexpr int N_WARPS = 16;
+	int num_blocks = (P + N_WARPS - 1) / N_WARPS;
+	gather_gradientsCUDA<NUM_CHANNELS> << <num_blocks, N_WARPS*WARP_SIZE >> > (
+		P,
+		point_offsets,
+		dL_dcolors_bin,
+		dL_dmean2D_bin,
+		dL_dconic2D_dopacity_bin,
+		dL_dcolors,
+		dL_dmean2D,
+		dL_dconic2D,
+		dL_dopacity);
+}
+	
 void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
-	const uint32_t* point_list,
+	const uint64_t* point_list,
 	int W, int H,
 	const float* bg_color,
 	const float2* means2D,
@@ -633,10 +839,9 @@ void BACKWARD::render(
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
-	float3* dL_dmean2D,
-	float4* dL_dconic2D,
-	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float2* dL_dmean2D,
+	float4* dL_dconic2D_dopacity)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
@@ -649,9 +854,8 @@ void BACKWARD::render(
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_dcolors,
 		dL_dmean2D,
-		dL_dconic2D,
-		dL_dopacity,
-		dL_dcolors
+		dL_dconic2D_dopacity
 		);
 }

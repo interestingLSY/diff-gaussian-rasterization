@@ -51,7 +51,7 @@ namespace FORWARD
 	void render(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
-		const uint32_t* point_list,
+		const uint64_t* point_list,
 		int W, int H,
 		const float2* points_xy_image,
 		const float* features,
