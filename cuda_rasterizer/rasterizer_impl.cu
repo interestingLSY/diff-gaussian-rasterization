@@ -386,6 +386,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
+	// printf("%d %d %.2f\n", P, R, (float)R/P);
+
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
@@ -403,14 +405,20 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		dL_dpix,
+		geomState.tiles_touched,
 		binningState.dL_dcolors,
 		binningState.dL_dmean2D,
-		binningState.dL_dconic2D_dopacity
+		binningState.dL_dconic2D_dopacity,
+		dL_dcolor,
+		(float3*)dL_dmean2D,
+		(float4*)dL_dconic,
+		dL_dopacity
 		), debug)
 	
 	CHECK_CUDA(BACKWARD::gather_gradients(
 		P,
 		geomState.point_offsets,
+		geomState.tiles_touched,
 		binningState.dL_dcolors,
 		binningState.dL_dmean2D,
 		binningState.dL_dconic2D_dopacity,
