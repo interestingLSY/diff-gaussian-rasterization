@@ -21,9 +21,9 @@
 namespace BACKWARD
 {
 	void render(
-		const dim3 grid, const dim3 block,
+		const dim3 grid, dim3 block,
 		const uint2* ranges,
-		const uint64_t* point_list,
+		const uint32_t* point_list,
 		int W, int H,
 		const float* bg_color,
 		const float2* means2D,
@@ -31,27 +31,12 @@ namespace BACKWARD
 		const float* colors,
 		const float* final_Ts,
 		const uint32_t* n_contrib,
+		const uint32_t* tiles_touched,
 		const float* dL_dpixels,
-		const uint32_t* tiles_touched,
-		float* dL_dcolors_bin,
-		float2* dL_dmean2D_bin,
-		float4* dL_dconic2D_dopacity_bin,
-		float* __restrict__ dL_dcolors_global,
-		float3* __restrict__ dL_dmean2D_global,
-		float4* __restrict__ dL_dconic2D_global,
-		float* __restrict__ dL_dopacity_global);
-
-	void gather_gradients(
-		int P,
-		const uint32_t* point_offsets,
-		const uint32_t* tiles_touched,
-		const float* dL_dcolors_bin,
-		const float2* dL_dmean2D_bin,
-		const float4* dL_dconic2D_dopacity_bin,
-		float* dL_dcolors,
 		float3* dL_dmean2D,
 		float4* dL_dconic2D,
-		float* dL_dopacity);
+		float* dL_dopacity,
+		float* dL_dcolors);
 
 	void preprocess(
 		int P, int D, int M,

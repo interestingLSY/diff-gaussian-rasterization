@@ -262,7 +262,7 @@ template <uint32_t CHANNELS>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
-	const uint64_t* __restrict__ point_list,
+	const uint32_t* __restrict__ point_list,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
@@ -314,7 +314,7 @@ renderCUDA(
 		int progress = i * BLOCK_SIZE + block.thread_rank();
 		if (range.x + progress < range.y)
 		{
-			int coll_id = point_list[range.x + progress]>>32;
+			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
@@ -376,7 +376,7 @@ renderCUDA(
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
-	const uint64_t* point_list,
+	const uint32_t* point_list,
 	int W, int H,
 	const float2* means2D,
 	const float* colors,

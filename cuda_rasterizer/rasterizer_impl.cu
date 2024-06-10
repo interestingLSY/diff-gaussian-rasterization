@@ -73,7 +73,7 @@ __global__ void duplicateWithKeys(
 	const float* depths,
 	const uint32_t* offsets,
 	uint64_t* gaussian_keys_unsorted,
-	uint64_t* gaussian_values_unsorted,
+	uint32_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid)
 {
@@ -103,7 +103,7 @@ __global__ void duplicateWithKeys(
 				key <<= 32;
 				key |= *((uint32_t*)&depths[idx]);
 				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx<<32 | off;
+				gaussian_values_unsorted[off] = idx;
 				off++;
 			}
 		}
@@ -190,9 +190,6 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
-	obtain(chunk, binning.dL_dcolors, P * NUM_CHANNELS, 128);
-	obtain(chunk, binning.dL_dmean2D, P * 2, 128);
-	obtain(chunk, binning.dL_dconic2D_dopacity, P * 4, 128);
 	return binning;
 }
 
@@ -386,8 +383,6 @@ void CudaRasterizer::Rasterizer::backward(
 	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
 	const dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	// printf("%d %d %.2f\n", P, R, (float)R/P);
-
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.
 	// If we were given precomputed colors and not SHs, use them.
@@ -404,28 +399,12 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
+		geomState.tiles_touched,
 		dL_dpix,
-		geomState.tiles_touched,
-		binningState.dL_dcolors,
-		binningState.dL_dmean2D,
-		binningState.dL_dconic2D_dopacity,
-		dL_dcolor,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
-		dL_dopacity
-		), debug)
-	
-	CHECK_CUDA(BACKWARD::gather_gradients(
-		P,
-		geomState.point_offsets,
-		geomState.tiles_touched,
-		binningState.dL_dcolors,
-		binningState.dL_dmean2D,
-		binningState.dL_dconic2D_dopacity,
-		dL_dcolor,
-		(float3*)dL_dmean2D,
-		(float4*)dL_dconic,
-		dL_dopacity), debug)
+		dL_dopacity,
+		dL_dcolor), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
