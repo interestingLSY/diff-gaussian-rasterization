@@ -395,36 +395,8 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-
-template<typename T>
-__forceinline__ __device__ T warpReduceSum(T val, int num_lanes = 32) {
-	#pragma unroll
-	for (int offset = num_lanes / 2; offset > 0; offset /= 2)
-		val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-	return val;
-}
-__forceinline__ __device__ float2 warpReduceSum(float2 val, int num_lanes = 32) {
-	#pragma unroll
-	for (int offset = num_lanes / 2; offset > 0; offset /= 2) {
-		val.x += __shfl_xor_sync(0xFFFFFFFF, val.x, offset);
-		val.y += __shfl_xor_sync(0xFFFFFFFF, val.y, offset);
-	}
-	return val;
-}
-__forceinline__ __device__ float4 warpReduceSum(float4 val, int num_lanes = 32) {
-	#pragma unroll
-	for (int offset = num_lanes / 2; offset > 0; offset /= 2) {
-		val.x += __shfl_xor_sync(0xFFFFFFFF, val.x, offset);
-		val.y += __shfl_xor_sync(0xFFFFFFFF, val.y, offset);
-		val.z += __shfl_xor_sync(0xFFFFFFFF, val.z, offset);
-		val.w += __shfl_xor_sync(0xFFFFFFFF, val.w, offset);
-	}
-	return val;
-}
-
-
 // Backward version of the rendering procedure.
-#define USE_ATOMIC_THRESHOLD 6
+#define USE_ATOMIC_THRESHOLD 10
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
